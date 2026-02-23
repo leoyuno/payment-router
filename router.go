@@ -44,6 +44,7 @@ type RoutingDecision struct {
 	FallbackUsed        bool     `json:"fallback_used"`
 	GeoMatch            bool     `json:"geo_match"`
 	CostBasisUSD        float64  `json:"cost_basis_usd"`
+	Retries             int      `json:"retries"`
 }
 
 type PaymentResponse struct {
@@ -466,7 +467,6 @@ func (r *Router) Route(ctx context.Context, req PaymentRequest) (PaymentResponse
 		return ci.proc.CostPerTxn < cj.proc.CostPerTxn
 	})
 
-	selected := candidates[0]
 	routingTime := time.Now()
 
 	flow = append(flow, FlowStep{
@@ -475,12 +475,12 @@ func (r *Router) Route(ctx context.Context, req PaymentRequest) (PaymentResponse
 		DurationMs: routingTime.Sub(startTime).Milliseconds(),
 		Data: map[string]interface{}{
 			"evaluations":        evaluations,
-			"selected_processor": selected.proc.ID,
+			"selected_processor": candidates[0].proc.ID,
 			"sort_order":         "health > geo > priority > cost",
 		},
 	})
 
-	// Determine if this is a fallback
+	// Determine if primary is available
 	primaryAvailable := false
 	for _, c := range candidates {
 		if c.proc.Priority == 1 && c.proc.GetStatus() == StatusHealthy {
@@ -488,53 +488,94 @@ func (r *Router) Route(ctx context.Context, req PaymentRequest) (PaymentResponse
 			break
 		}
 	}
-	fallbackUsed := !primaryAvailable || selected.proc.Priority != 1
 
-	// Step 3: Outbound Request to Processor
-	procReqTime := time.Now()
-	flow = append(flow, FlowStep{
-		Step: 3, Label: "Processor Request", Direction: "outbound",
-		Timestamp: procReqTime,
-		Data: map[string]interface{}{
-			"processor":    selected.proc.ID,
-			"endpoint":     fmt.Sprintf("POST https://%s.payments.com/v1/authorize", selected.proc.ID),
-			"amount":       req.Amount,
-			"currency":     req.Currency,
-			"payment_method": req.PaymentMethod,
-		},
-	})
+	// Retry cascade: try each candidate in sorted order
+	stepNum := 3
+	retries := 0
+	var lastErr error
 
-	// Execute through circuit breaker
-	result, err := selected.proc.breaker.Execute(func() (interface{}, error) {
-		approved, latMs, authErr := selected.proc.Authorize(ctx, req)
-		return [2]interface{}{approved, latMs}, authErr
-	})
+	for i, selected := range candidates {
+		fallbackUsed := !primaryAvailable || selected.proc.Priority != 1
 
-	now := time.Now()
-	r.txnMu.Lock()
-	r.txnCounter++
-	txnID := fmt.Sprintf("txn_%06d", r.txnCounter)
-	r.txnMu.Unlock()
-
-	var status TransactionStatus
-	var latencyMs int64
-	var reason string
-
-	if err != nil {
-		status = TxnError
-		selected.proc.RecordResult(false, true)
-		reason = buildReason(selected, fallbackUsed, true)
-
-		// Step 4: Processor Response (error)
+		// Outbound Request to Processor
+		procReqTime := time.Now()
 		flow = append(flow, FlowStep{
-			Step: 4, Label: "Processor Response", Direction: "response",
-			Timestamp: now, DurationMs: now.Sub(procReqTime).Milliseconds(),
+			Step: stepNum, Label: "Processor Request", Direction: "outbound",
+			Timestamp: procReqTime,
 			Data: map[string]interface{}{
-				"processor": selected.proc.ID,
-				"status":    "ERROR",
-				"error":     err.Error(),
+				"processor":      selected.proc.ID,
+				"endpoint":       fmt.Sprintf("POST https://%s.payments.com/v1/authorize", selected.proc.ID),
+				"amount":         req.Amount,
+				"currency":       req.Currency,
+				"payment_method": req.PaymentMethod,
+				"attempt":        i + 1,
 			},
 		})
+		stepNum++
+
+		// Execute through circuit breaker
+		result, err := selected.proc.breaker.Execute(func() (interface{}, error) {
+			approved, latMs, authErr := selected.proc.Authorize(ctx, req)
+			return [2]interface{}{approved, latMs}, authErr
+		})
+
+		now := time.Now()
+
+		if err != nil {
+			// Record error for this processor
+			selected.proc.RecordResult(false, true)
+			lastErr = err
+
+			// Log failed attempt in flow
+			flow = append(flow, FlowStep{
+				Step: stepNum, Label: "Processor Error — Retrying", Direction: "response",
+				Timestamp: now, DurationMs: now.Sub(procReqTime).Milliseconds(),
+				Data: map[string]interface{}{
+					"processor": selected.proc.ID,
+					"status":    "ERROR",
+					"error":     err.Error(),
+					"attempt":   i + 1,
+				},
+			})
+			stepNum++
+			retries++
+			continue // Try next candidate
+		}
+
+		// Success or business decline — we're done
+		pair := result.([2]interface{})
+		approved := pair[0].(bool)
+		latencyMs := pair[1].(int64)
+
+		selected.proc.RecordResult(approved, false)
+
+		var status TransactionStatus
+		if approved {
+			status = TxnApproved
+		} else {
+			status = TxnDeclined
+		}
+
+		reason := buildReason(selected, fallbackUsed, false, retries)
+
+		r.txnMu.Lock()
+		r.txnCounter++
+		txnID := fmt.Sprintf("txn_%06d", r.txnCounter)
+		r.txnMu.Unlock()
+
+		// Processor Response
+		flow = append(flow, FlowStep{
+			Step: stepNum, Label: "Processor Response", Direction: "response",
+			Timestamp: now, DurationMs: latencyMs,
+			Data: map[string]interface{}{
+				"processor":  selected.proc.ID,
+				"status":     status,
+				"latency_ms": latencyMs,
+				"reference":  fmt.Sprintf("%s-ref-%s", selected.proc.ID, txnID),
+				"attempt":    i + 1,
+			},
+		})
+		stepNum++
 
 		resp := PaymentResponse{
 			TransactionID: txnID, Status: status,
@@ -543,14 +584,15 @@ func (r *Router) Route(ctx context.Context, req PaymentRequest) (PaymentResponse
 				Reason: reason, ProcessorsEvaluated: evaluated,
 				FallbackUsed: fallbackUsed, GeoMatch: selected.geoScore == 1,
 				CostBasisUSD: selected.proc.CostPerTxn,
+				Retries:      retries,
 			},
 			Amount: req.Amount, Currency: req.Currency,
-			ProcessorMsg: err.Error(), CreatedAt: now,
+			CreatedAt: now,
 		}
 
-		// Step 5: Final Response
+		// Final Response
 		flow = append(flow, FlowStep{
-			Step: 5, Label: "Final Response", Direction: "response",
+			Step: stepNum, Label: "Final Response", Direction: "response",
 			Timestamp:  now,
 			DurationMs: now.Sub(startTime).Milliseconds(),
 			Data: map[string]interface{}{
@@ -559,6 +601,7 @@ func (r *Router) Route(ctx context.Context, req PaymentRequest) (PaymentResponse
 				"processor_used": selected.proc.ID,
 				"routing_reason": reason,
 				"total_time_ms":  now.Sub(startTime).Milliseconds(),
+				"retries":        retries,
 			},
 		})
 		resp.Flow = flow
@@ -566,70 +609,57 @@ func (r *Router) Route(ctx context.Context, req PaymentRequest) (PaymentResponse
 		r.storeTransaction(Transaction{
 			ID: txnID, ProcessorUsed: selected.proc.ID,
 			Status: status, Amount: req.Amount, Currency: req.Currency,
-			Country: req.Country, RoutingReason: reason, LatencyMs: 0,
+			Country: req.Country, RoutingReason: reason, LatencyMs: latencyMs,
 			CreatedAt: now,
 		})
 
 		return resp, nil
 	}
 
-	pair := result.([2]interface{})
-	approved := pair[0].(bool)
-	latencyMs = pair[1].(int64)
+	// All candidates failed — return error from last attempt
+	now := time.Now()
+	r.txnMu.Lock()
+	r.txnCounter++
+	txnID := fmt.Sprintf("txn_%06d", r.txnCounter)
+	r.txnMu.Unlock()
 
-	selected.proc.RecordResult(approved, false)
-
-	if approved {
-		status = TxnApproved
-	} else {
-		status = TxnDeclined
+	reason := "all_processors_failed"
+	errMsg := "no_processors_available"
+	if lastErr != nil {
+		errMsg = lastErr.Error()
 	}
 
-	reason = buildReason(selected, fallbackUsed, false)
-
-	// Step 4: Processor Response (success/decline)
 	flow = append(flow, FlowStep{
-		Step: 4, Label: "Processor Response", Direction: "response",
-		Timestamp: now, DurationMs: latencyMs,
-		Data: map[string]interface{}{
-			"processor":  selected.proc.ID,
-			"status":     status,
-			"latency_ms": latencyMs,
-			"reference":  fmt.Sprintf("%s-ref-%s", selected.proc.ID, txnID),
-		},
-	})
-
-	resp := PaymentResponse{
-		TransactionID: txnID, Status: status,
-		ProcessorUsed: selected.proc.ID,
-		RoutingDecision: RoutingDecision{
-			Reason: reason, ProcessorsEvaluated: evaluated,
-			FallbackUsed: fallbackUsed, GeoMatch: selected.geoScore == 1,
-			CostBasisUSD: selected.proc.CostPerTxn,
-		},
-		Amount: req.Amount, Currency: req.Currency,
-		CreatedAt: now,
-	}
-
-	// Step 5: Final Response
-	flow = append(flow, FlowStep{
-		Step: 5, Label: "Final Response", Direction: "response",
+		Step: stepNum, Label: "Final Response", Direction: "response",
 		Timestamp:  now,
 		DurationMs: now.Sub(startTime).Milliseconds(),
 		Data: map[string]interface{}{
 			"transaction_id": txnID,
-			"status":         status,
-			"processor_used": selected.proc.ID,
+			"status":         TxnError,
+			"error":          errMsg,
 			"routing_reason": reason,
 			"total_time_ms":  now.Sub(startTime).Milliseconds(),
+			"retries":        retries,
 		},
 	})
-	resp.Flow = flow
+
+	resp := PaymentResponse{
+		TransactionID: txnID, Status: TxnError,
+		ProcessorUsed: candidates[len(candidates)-1].proc.ID,
+		RoutingDecision: RoutingDecision{
+			Reason: reason, ProcessorsEvaluated: evaluated,
+			FallbackUsed: true, GeoMatch: false,
+			CostBasisUSD: 0, Retries: retries,
+		},
+		Amount: req.Amount, Currency: req.Currency,
+		ProcessorMsg: errMsg, CreatedAt: now,
+		Flow: flow,
+	}
 
 	r.storeTransaction(Transaction{
-		ID: txnID, ProcessorUsed: selected.proc.ID,
-		Status: status, Amount: req.Amount, Currency: req.Currency,
-		Country: req.Country, RoutingReason: reason, LatencyMs: latencyMs,
+		ID: txnID, ProcessorUsed: candidates[len(candidates)-1].proc.ID,
+		Status: TxnError, Amount: req.Amount, Currency: req.Currency,
+		Country: req.Country, RoutingReason: reason, LatencyMs: 0,
 		CreatedAt: now,
 	})
 
@@ -692,19 +722,24 @@ func healthScore(s ProcessorStatus) int {
 	}
 }
 
-func buildReason(c candidate, fallback bool, isError bool) string {
+func buildReason(c candidate, fallback bool, isError bool, retries int) string {
+	suffix := ""
+	if retries > 0 {
+		suffix = "_after_retry"
+	}
+
 	if isError {
 		if fallback {
-			return "fallback_processor_error"
+			return "fallback_processor_error" + suffix
 		}
-		return "primary_processor_error"
+		return "primary_processor_error" + suffix
 	}
 
 	if !fallback {
 		if c.geoScore == 1 {
-			return "primary_healthy_geo_match"
+			return "primary_healthy_geo_match" + suffix
 		}
-		return "primary_healthy"
+		return "primary_healthy" + suffix
 	}
 
 	// Fallback scenarios
@@ -716,10 +751,10 @@ func buildReason(c candidate, fallback bool, isError bool) string {
 
 	switch status {
 	case StatusDegraded:
-		return "failover_to_degraded" + geo
+		return "failover_to_degraded" + geo + suffix
 	case StatusDown:
-		return "last_resort_all_degraded"
+		return "last_resort_all_degraded" + suffix
 	default:
-		return "failover_primary_unavailable" + geo
+		return "failover_primary_unavailable" + geo + suffix
 	}
 }

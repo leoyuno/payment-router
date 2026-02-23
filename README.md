@@ -93,7 +93,18 @@ Candidates are filtered and sorted in this strict order:
 3. **Priority** — processor configuration priority (1 = primary, 2 = secondary, 3 = backup)
 4. **Cost** — among equally ranked candidates, the cheapest fee wins
 
-Every payment response includes a `routing_decision` object explaining why the processor was chosen, whether a fallback was used, and the cost basis. A 5-step `flow` trace captures the full pipeline from inbound request to final response.
+Every payment response includes a `routing_decision` object explaining why the processor was chosen, whether a fallback was used, and the cost basis. The `flow` trace captures the full pipeline from inbound request to final response.
+
+### Retry Cascade
+
+When a processor returns an infrastructure error (timeout, connection refused, simulated error), the router does **not** fail the request immediately. Instead, it records the failure and tries the next candidate in the sorted list. This continues until either:
+
+- A processor returns a **success or business decline** — the response is returned normally
+- **All candidates fail** — the request returns an error with reason `all_processors_failed`
+
+The `routing_decision` includes a `retries` field indicating how many processors were skipped before the final one succeeded. A `retries` value of 0 means the first candidate handled the request. Routing reason strings include an `_after_retry` suffix when the successful processor was reached after one or more retries.
+
+Only infrastructure errors trigger retry — business declines (the processor responded but said "no") are final and are not retried, since the next processor would likely decline for the same reason.
 
 ---
 
