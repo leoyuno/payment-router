@@ -282,11 +282,14 @@ func (p *Processor) SetSimulation(sim SimulateRequest) {
 	p.simFailRate = sim.FailureRate
 	p.simForceError = sim.ForceError
 
-	// When simulation is cleared, reset health window to allow recovery
+	// When simulation is cleared, seed window with 60% success rate → DEGRADED.
+	// Processor must earn HEALTHY through real successful transactions.
 	if wasActive && !sim.Active {
 		p.recentResults = p.recentResults[:0]
-		p.approvalRate = 1.0
-		p.status = StatusHealthy
+		for i := 0; i < 5; i++ {
+			p.recentResults = append(p.recentResults, i < 3) // 3 true, 2 false = 60%
+		}
+		p.updateHealth() // 60% → DEGRADED (below 70% threshold)
 	}
 }
 

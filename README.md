@@ -207,7 +207,7 @@ Each processor maintains a sliding window of its last **20 transactions**.
 | DEGRADED | Success rate < 70% | Still eligible, ranked lower |
 | DOWN | Success rate < 50% | Excluded from routing |
 
-State transitions are evaluated after every transaction. Recovery is automatic — when a failure simulation is cleared, the health window resets and the processor immediately returns to HEALTHY, allowing it to reclaim its primary routing slot without waiting for the window to flush.
+State transitions are evaluated after every transaction. Recovery is **gradual** — when a failure simulation is cleared, the health window is seeded with a 60% success rate (DEGRADED). The processor is immediately eligible for routing but must accumulate real successful transactions to reach HEALTHY (≥70%) and reclaim its primary slot.
 
 **Why these thresholds?** In payment processing, a 70% approval rate is already a serious problem (3 out of 10 customers are failing). The 50% threshold for DOWN is the point where routing traffic to this processor causes more harm than good. The 20-transaction window balances responsiveness (detecting problems quickly) against stability (not overreacting to a few random declines).
 
@@ -279,7 +279,7 @@ curl -s -X POST http://localhost:8080/v1/payments/authorize \
   | python3 -c "import json,sys; r=json.load(sys.stdin); print(f'{r[\"processor_used\"]}: {r[\"routing_decision\"][\"reason\"]}')"
 ```
 
-**Expected:** Processor A returns to HEALTHY immediately (health window resets on simulation clear). The next BR payment routes back to `processor-a` with reason `primary_healthy_geo_match`.
+**Expected:** Processor A returns to DEGRADED (not HEALTHY) — recovery is gradual. It is still eligible for routing but ranked below any HEALTHY processors. After enough successful real transactions push its approval rate above 70%, it will reclaim HEALTHY and its primary slot.
 
 ### Step 5 — Manual override
 
